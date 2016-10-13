@@ -16,10 +16,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -254,13 +253,14 @@ func (b *batch) Fire(notifier muster.Notifier) {
 		break
 	}
 
-	// TODO GZIP!
-
-	// sigh
+	reqBody, gzipped := buildReqReader(blob)
 	url := fmt.Sprintf("%s/1/batch", apiHost)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(blob))
-	req.Header.Set("User-Agent", userAgent)
+	req, err := http.NewRequest("POST", url, reqBody)
 	req.Header.Set("Content-Type", "application/json")
+	if gzipped {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Add("X-Honeycomb-Team", writeKey)
 
 	// send off batch!
@@ -317,57 +317,17 @@ func (b *batch) Fire(notifier muster.Notifier) {
 	}
 }
 
-// sendRequest sends an individual request to Honeycomb and returns
-func (b *batch) sendRequest(e *Event) {
-	start := time.Now().UTC()
-	if b.testNower != nil {
-		start = b.testNower.Now()
+// buildReqReader returns an io.Reader and a boolean, indicating whether or not
+// the io.Reader is gzip-compressed.
+func buildReqReader(jsonEncoded []byte) (io.Reader, bool) {
+	buf := bytes.Buffer{}
+	g := gzip.NewWriter(&buf)
+	if _, err := g.Write(jsonEncoded); err == nil {
+		if err = g.Close(); err == nil { // flush
+			return &buf, true
+		}
 	}
-	timestamp := e.Timestamp
-	blob, err := json.Marshal(e.data)
-	if err != nil {
-		// TODO add logging or something to raise this error
-		sd.Increment("json_marshal_errors")
-		return
-	}
-
-	userAgent := fmt.Sprintf("libhoney-go/%s", version)
-	if UserAgentAddition != "" {
-		userAgent = fmt.Sprintf("%s %s", userAgent, strings.TrimSpace(UserAgentAddition))
-	}
-
-	url := fmt.Sprintf("%s/1/events/%s", e.APIHost, e.Dataset)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(blob))
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Add("X-Honeycomb-Team", e.WriteKey)
-	req.Header.Add("X-Event-Time", timestamp.Format(time.RFC3339))
-	req.Header.Add("X-Honeycomb-SampleRate", strconv.Itoa(int(e.SampleRate)))
-
-	resp, err := b.httpClient.Do(req)
-
-	end := time.Now().UTC()
-	if b.testNower != nil {
-		end = b.testNower.Now()
-	}
-	evResp := Response{
-		Duration: end.Sub(start),
-		Metadata: e.Metadata,
-	}
-	defer func() {
-		b.enqueueResponse(evResp)
-	}()
-	if err != nil {
-		// TODO add logging or something to raise this error
-		sd.Increment("send_errors")
-		evResp.Err = err
-		return
-	}
-	sd.Increment("messages_sent")
-	defer resp.Body.Close()
-	evResp.StatusCode = resp.StatusCode
-	body, _ := ioutil.ReadAll(resp.Body)
-	evResp.Body = body
+	return bytes.NewReader(jsonEncoded), false
 }
 
 // nower to make testing easier
